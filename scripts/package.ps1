@@ -41,7 +41,8 @@ $zip = Join-Path $root "dist\$name.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path "$stage\*" -DestinationPath $zip
 $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-"$hash  $name.zip" | Out-File -Encoding ascii "$zip.sha256"
+# LF line ending so `sha256sum -c` works on the file.
+[IO.File]::WriteAllText("$zip.sha256", "$hash  $name.zip`n")
 
 Write-Host "created dist\$name.zip"
 Write-Host "sha256 $hash"
