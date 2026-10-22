@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/retex-core", "crates/retex-cli", "crates/retex-hook", "crates/retex-inject", "crates/retex-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Depth"]
+repository = "https://github.com/Depth118/retex"
+rust-version = "1.95"
+
+[workspace.dependencies]
+flate2 = "1.0"
+thiserror = "1.0"
+rand = "0.8"
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"

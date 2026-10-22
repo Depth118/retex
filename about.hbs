@@ -1,0 +1,15 @@
+Retex includes the following third-party software. Their licenses and
+copyright notices are reproduced below.
+
+{{#each licenses}}
+================================================================================
+{{{name}}}
+
+Used by:
+{{#each used_by}}
+  - {{crate.name}} {{crate.version}}{{#if crate.repository}} ({{crate.repository}}){{/if}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

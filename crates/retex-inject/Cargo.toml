@@ -1,0 +1,13 @@
+[package]
+name = "retex-inject"
+description = "32-bit injector/launcher for retex_hook.dll"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "retex-inject"
+path = "src/main.rs"

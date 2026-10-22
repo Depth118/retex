@@ -1,0 +1,9 @@
+target/
+dist/
+__pycache__/
+*.pyc
+
+# Original TexMod binaries and dumps: kept locally for analysis, not redistributed.
+research/original/
+research/unpacked/
+research/scripts/analysis/work/

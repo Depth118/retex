@@ -1,0 +1,66 @@
+# Third-party license notices for the release zip:
+#   cargo about generate about.hbs -o THIRD-PARTY-LICENSES.txt
+targets = ["x86_64-pc-windows-msvc", "i686-pc-windows-msvc"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+accepted = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "BSL-1.0",
+    "CC0-1.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    "LicenseRef-UFL-1.0",
+    "MPL-2.0",
+    "0BSD",
+    "Unlicense",
+    "Bitstream-Vera",
+]
+
+# minhook bundles the MinHook C library (BSD-2-Clause), which its crate
+# metadata does not declare.
+[minhook.clarify]
+license = "MIT AND BSD-2-Clause"
+
+[[minhook.clarify.files]]
+path = "LICENSE"
+license = "MIT"
+checksum = "81053d86dc61a9744c0bab79674e6864ef206c0084caf1cf7f8a9db7c12efd24"
+
+[[minhook.clarify.files]]
+path = "minhook/LICENSE.txt"
+license = "BSD-2-Clause"
+checksum = "4f21f857550d7be854da6ea5f2da4e6775ca4e3fbb535e4f3d961c47d0bf3335"
+
+# egui's built-in fonts: Hack (MIT + Bitstream Vera), Ubuntu (UFL),
+# Noto Emoji (OFL), and the MIT/OFL emoji icon font.
+[epaint_default_fonts.clarify]
+license = "MIT AND Bitstream-Vera AND OFL-1.1 AND Ubuntu-font-1.0"
+
+[[epaint_default_fonts.clarify.files]]
+path = "fonts/Hack-Regular.txt"
+license = "MIT AND Bitstream-Vera"
+checksum = "47c0cccbeec7e8614548cc485588b28149e7874188df5f41b36efebcee285c87"
+
+[[epaint_default_fonts.clarify.files]]
+path = "fonts/OFL.txt"
+license = "OFL-1.1"
+checksum = "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2"
+
+[[epaint_default_fonts.clarify.files]]
+path = "fonts/UFL.txt"
+license = "Ubuntu-font-1.0"
+checksum = "2f0015108d68627bd788d313f529c21ff4da2c2c42a5e1f3883acc83480f9002"
+
+[[epaint_default_fonts.clarify.files]]
+path = "fonts/emoji-icon-font-mit-license.txt"
+license = "MIT"
+checksum = "b9d2c1d909aa149996fd4c91dcb92b2362a04431640c1d200959da94caf8cde1"

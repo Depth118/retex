@@ -1,0 +1,28 @@
+[package]
+name = "retex-app"
+description = "Retex desktop app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = [
+    "accesskit",
+    "clipboard",
+    "default_fonts",
+    "glow",
+    "links",
+    "system_fonts",
+] }
+egui_extras = "0.37"
+rfd = "0.17"
+image = { version = "0.25", default-features = false, features = ["png", "bmp", "dds"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+retex-core = { path = "../retex-core" }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
