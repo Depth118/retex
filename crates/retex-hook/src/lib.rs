@@ -22,7 +22,7 @@ mod imp {
     use std::mem;
     use std::os::windows::ffi::OsStringExt;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicPtr, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
     use std::sync::{LazyLock, Mutex, Once, OnceLock};
 
     const PAGE_EXECUTE_READWRITE: u32 = 0x40;
@@ -105,13 +105,26 @@ mod imp {
     static ORIG_D3D9: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static ORIG_CREATE_DEVICE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static ORIG_SET_TEXTURE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-    static ORIG_TEXTURE_RELEASE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+    /// Per-texture logging is off unless `RETEX_DEBUG` is set: a log write
+    /// opens and closes a file, which is far too slow for per-bind checks.
+    static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+    fn verbose() -> bool {
+        VERBOSE.load(Ordering::Relaxed)
+    }
 
     /// Texture pointer -> `(hash, format)` when the pack replaces it, `None`
     /// when it never will. Entries are evicted when the texture is released,
     /// so a recycled pointer never inherits a stale hash.
     type TextureInfo = Option<(u32, u32)>;
     static HASH_CACHE: LazyLock<Mutex<HashMap<usize, TextureInfo>>> =
+        LazyLock::new(Default::default);
+
+    /// Texture vtable -> its original `IUnknown::Release`. Keyed by vtable
+    /// because ReShade (or a second copy of this DLL) can expose more than one
+    /// implementation, and each needs its own original to forward to.
+    static RELEASE_ORIGINALS: LazyLock<Mutex<HashMap<usize, usize>>> =
         LazyLock::new(Default::default);
 
     /// `(device, hash, format)` -> replacement texture, or 0 if creating it
@@ -254,15 +267,49 @@ mod imp {
         }
 
         let hash = hash_level_zero(texture, &desc)?;
-        log(&format!(
-            "TEXTURE {}x{} fmt=0x{:08X} pool={} hash=0x{hash:08X}",
-            desc.width, desc.height, desc.format, desc.pool
-        ));
+        if verbose() {
+            log(&format!(
+                "TEXTURE {}x{} fmt=0x{:08X} pool={} hash=0x{hash:08X}",
+                desc.width, desc.height, desc.format, desc.pool
+            ));
+        }
         has_replacement(hash).then_some((hash, desc.format))
+    }
+
+    /// Start forwarding `IUnknown::Release` for this vtable so cached hashes are
+    /// dropped with the texture. Best effort, and idempotent: a vtable is
+    /// patched once even if several textures share it.
+    unsafe fn ensure_release_hook(vt: *mut *mut c_void) -> bool {
+        let key = vt as usize;
+        let Ok(mut originals) = RELEASE_ORIGINALS.lock() else {
+            return false;
+        };
+        if originals.contains_key(&key) {
+            return true;
+        }
+        let current = *vt.add(IUNKNOWN_RELEASE);
+        let hook = hook_texture_release as *const () as *mut c_void;
+        if current == hook {
+            // Already patched by this module but the entry is gone (a poisoned
+            // lock). Forwarding is impossible, but hashing stays cached.
+            return false;
+        }
+        originals.insert(key, current as usize);
+        patch_slot(vt, IUNKNOWN_RELEASE, hook);
+        log(&format!(
+            "hooked IDirect3DTexture9::Release (vtable {vt:p})"
+        ));
+        true
     }
 
     /// `(hash, format)` of a texture the pack replaces, hashing it only on
     /// its first bind.
+    ///
+    /// The result is cached even when Release tracking could not be installed.
+    /// A texture that cannot be tracked at all would otherwise be re-hashed on
+    /// every single bind, which stalls the render thread (LockRect on a
+    /// D3DPOOL_DEFAULT surface, then a full-surface CRC) and, in debug builds
+    /// of this hook, wrote a log line per bind.
     unsafe fn texture_info_cached(texture: *mut c_void) -> Option<(u32, u32)> {
         let key = texture as usize;
         if let Some(cached) = HASH_CACHE.lock().ok()?.get(&key) {
@@ -271,32 +318,35 @@ mod imp {
 
         let vt = vtable(texture);
         let get_type: GetTypeFn = mem::transmute(*vt.add(IDIRECT3DBASETEXTURE9_GET_TYPE));
-        if get_type(texture) != D3DRTYPE_TEXTURE {
-            return None;
-        }
-        let info = texture_info(texture);
+        let info = if get_type(texture) == D3DRTYPE_TEXTURE {
+            texture_info(texture)
+        } else {
+            // Cube/volume textures are not replaceable (the legacy hash only
+            // covers one 2D surface), but the negative answer is still worth
+            // caching.
+            None
+        };
 
-        // Only cache what we will hear about being released; otherwise a new
-        // texture allocated at the same address would inherit this result.
-        let tracked = hook_slot(
-            vt,
-            IUNKNOWN_RELEASE,
-            hook_texture_release as *const () as *mut c_void,
-            &ORIG_TEXTURE_RELEASE,
-            "IDirect3DTexture9::Release",
-        );
-        if tracked {
-            if let Ok(mut cache) = HASH_CACHE.lock() {
-                if cache.len() < MAX_TRACKED_TEXTURES {
-                    cache.insert(key, info);
-                }
+        if let Ok(mut cache) = HASH_CACHE.lock() {
+            if cache.len() < MAX_TRACKED_TEXTURES {
+                cache.insert(key, info);
             }
         }
+        ensure_release_hook(vt);
         info
     }
 
     unsafe extern "system" fn hook_texture_release(texture: *mut c_void) -> u32 {
-        let original: ReleaseFn = mem::transmute(ORIG_TEXTURE_RELEASE.load(Ordering::Acquire));
+        let original = RELEASE_ORIGINALS
+            .lock()
+            .ok()
+            .and_then(|originals| originals.get(&(vtable(texture) as usize)).copied());
+        let Some(original) = original else {
+            // The hook is only installed for registered vtables, so this is
+            // unreachable; leaking beats calling an unknown address.
+            return 0;
+        };
+        let original: ReleaseFn = mem::transmute(original);
         let remaining = original(texture);
         if remaining == 0 {
             if let Ok(mut cache) = HASH_CACHE.lock() {
@@ -646,7 +696,13 @@ mod imp {
     }
 
     unsafe fn install() {
-        log(&format!("initializing (pid={})", std::process::id()));
+        let debug =
+            std::env::var_os("RETEX_DEBUG").is_some_and(|value| !value.is_empty() && value != "0");
+        VERBOSE.store(debug, Ordering::Relaxed);
+        log(&format!(
+            "initializing (pid={}, verbose={debug})",
+            std::process::id()
+        ));
         load_packs();
         let module = LoadLibraryA(b"d3d9.dll\0".as_ptr());
         if module.is_null() {

@@ -334,6 +334,21 @@ fn launch(target: &Path, packs: &[PathBuf]) -> Result<()> {
     }
 
     let hook = locate_hook()?;
+
+    // The game may still load a copy installed as `retex.asi` (Ultimate ASI
+    // Loader). Both copies would then run; keep the ASI copy at the same build
+    // as the one being injected so an older hook cannot keep doing work in the
+    // background.
+    let asi = game_dir.join("retex.asi");
+    if asi.is_file() {
+        if let Err(error) = fs::copy(&hook, &asi) {
+            eprintln!(
+                "warning: could not update {} (close the game and retry): {error}",
+                asi.display()
+            );
+        }
+    }
+
     let injector = locate_injector()?;
     let status = std::process::Command::new(&injector)
         .arg(&hook)
