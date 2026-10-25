@@ -30,7 +30,11 @@ warnings.
 - **Pack inspector.** Open any pack to verify it (CRCs, bitmaps,
   `texmod.def`), search textures by hash or name, and preview them.
 - **Command-line tool** for listing, verifying, extracting and building packs.
-- Large packs are indexed lazily, so a several-hundred-MB pack doesn't have to
+- **No in-game stutter from packs.** Textures are matched as the game loads
+  them, and replacements are decoded on background threads, so the work
+  happens behind loading screens instead of mid-race.
+- **Light on memory.** Packs are indexed, not unpacked: only the textures the
+  game actually uses are decoded, so a several-hundred-MB pack doesn't have to
   fit in a 32-bit game's memory.
 
 ## Download
@@ -140,9 +144,12 @@ bytes of the locked surface, ignoring pitch. The full specification is in
 [`docs/texmod-format.md`](docs/texmod-format.md); design notes are in
 [`docs/design.md`](docs/design.md).
 
-In the game, the hook intercepts `Direct3DCreate9`, wraps the device, and in
-`SetTexture` hashes each texture and swaps in the pack's replacement, created
-with `D3DXCreateTextureFromFileInMemory` like TexMod does.
+In the game, the hook intercepts `Direct3DCreate9` and the device's texture
+calls. Each texture is hashed when the game finishes writing it (usually during
+a loading screen); if a pack replaces it, background threads read, decrypt and
+inflate the replacement while the game keeps loading, and the texture is
+created with `D3DXCreateTextureFromFileInMemory`, as TexMod does. When the game
+draws, `SetTexture` swaps in the replacement with a single lookup.
 
 Tested with *Need for Speed: Underground* and the 345 MB *Redux* pack, through
 both the launcher and Ultimate ASI Loader, alongside ReShade.

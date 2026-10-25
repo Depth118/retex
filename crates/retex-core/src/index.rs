@@ -177,20 +177,23 @@ impl PackageIndex {
         file.read_exact(&mut raw)?;
         xor::apply_at(&mut raw, meta.data_offset as usize);
 
-        let compressed = if meta.flags & 1 != 0 {
+        let start = if meta.flags & 1 != 0 {
             let check = if meta.flags & 8 != 0 {
                 (meta.dos_time >> 8) as u8
             } else {
                 (meta.crc >> 24) as u8
             };
-            zipcrypto::decrypt(&raw, &PASSWORD, check).ok_or(Error::Decrypt)?
+            zipcrypto::decrypt_in_place(&mut raw, &PASSWORD, check).ok_or(Error::Decrypt)?
         } else {
-            raw
+            0
         };
 
         let data = match meta.method {
-            0 => compressed,
-            8 => container::inflate(&compressed)?,
+            0 => {
+                raw.drain(..start);
+                raw
+            }
+            8 => container::inflate(&raw[start..])?,
             method => {
                 return Err(Error::Zip(format!(
                     "unsupported method {method} for {}",

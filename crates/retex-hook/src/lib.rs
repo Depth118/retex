@@ -1,13 +1,23 @@
 //! Retex D3D9 hook (32-bit).
 //!
-//! M2: inline detour on `Direct3DCreate9`, vtable hooks on `CreateDevice` and
-//! `SetTexture`, legacy texture hash computed on first bind.
+//! An inline detour on `Direct3DCreate9` leads to vtable hooks on
+//! `CreateDevice`, `CreateTexture`, `SetTexture`, and the texture's
+//! `LockRect`/`UnlockRect`/`Release`. Textures are identified with TexMod's
+//! hash and swapped for the pack's replacement when bound.
 //!
-//! M3: loads a `.tpf` pack (`RETEX_PACK` environment variable) and replaces
-//! bound textures whose hash has a matching entry.
+//! Work is kept off the frame as far as possible:
 //!
-//! Load as an ASI plugin (export `Initialize`) or inject with
-//! `retex-inject`.
+//! - A texture is hashed as soon as the game finishes writing it (usually
+//!   behind a loading screen), not when it is first drawn. Textures filled any
+//!   other way are hashed on first bind instead.
+//! - Replacements are read, decrypted and inflated by background threads, in
+//!   parallel with the game's own loading; only the D3D texture creation runs
+//!   on the game's thread.
+//! - After that, a bind is one hash-map lookup.
+//!
+//! Load as an ASI plugin (export `InitializeASI`) or inject with
+//! `retex-inject` (export `Initialize`). Only the first copy loaded into a
+//! process activates.
 
 #![cfg_attr(not(all(windows, target_arch = "x86")), allow(unused))]
 
@@ -16,18 +26,24 @@ mod imp {
     #![allow(clippy::manual_c_str_literals)]
     use minhook::MinHook;
     use retex_core::{bytes_per_pixel, texmod_crc, PackageIndex};
-    use std::collections::HashMap;
+    use std::cell::Cell;
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::ffi::{c_void, CString, OsString};
+    use std::hash::{BuildHasherDefault, Hasher};
     use std::io::Write;
     use std::mem;
     use std::os::windows::ffi::OsStringExt;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-    use std::sync::{LazyLock, Mutex, Once, OnceLock};
+    use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, Once, OnceLock};
+    use std::time::Instant;
 
     const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    const D3DERR_INVALIDCALL: i32 = 0x8876_086Cu32 as i32;
 
     const IUNKNOWN_RELEASE: usize = 2;
+    const IDIRECT3DRESOURCE9_GET_DEVICE: usize = 3;
     const IDIRECT3D9_CREATE_DEVICE: usize = 16;
     const IDIRECT3DDEVICE9_CREATE_TEXTURE: usize = 23;
     const IDIRECT3DDEVICE9_SET_TEXTURE: usize = 65;
@@ -45,6 +61,9 @@ mod imp {
     const D3DPOOL_MANAGED: u32 = 3;
     const D3DLOCK_READONLY: u32 = 0x0000_0010;
     const MAX_TRACKED_TEXTURES: usize = 200_000;
+    /// Decoded replacements waiting for texture creation; background decoding
+    /// pauses above this so a 32-bit game is not flooded.
+    const MAX_READY_BYTES: usize = 256 << 20;
 
     type Direct3DCreate9Fn = unsafe extern "system" fn(u32) -> *mut c_void;
     type CreateDeviceFn = unsafe extern "system" fn(
@@ -69,6 +88,7 @@ mod imp {
     ) -> i32;
     type SetTextureFn = unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> i32;
     type ReleaseFn = unsafe extern "system" fn(*mut c_void) -> u32;
+    type GetDeviceFn = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32;
     type GetTypeFn = unsafe extern "system" fn(*mut c_void) -> u32;
     type GetLevelDescFn = unsafe extern "system" fn(*mut c_void, u32, *mut D3DSurfaceDesc) -> i32;
     type LockRectFn =
@@ -102,8 +122,42 @@ mod imp {
         pixels: Vec<u8>,
     }
 
+    /// Multiply-rotate hasher for pointer and texture-hash keys. The default
+    /// SipHash is built to resist adversarial keys, which these are not, and
+    /// it would run on every texture bind.
+    #[derive(Default, Clone, Copy)]
+    struct FastHasher(u64);
+
+    impl FastHasher {
+        #[inline]
+        fn add(&mut self, value: u64) {
+            self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x517C_C1B7_2722_0A95);
+        }
+    }
+
+    impl Hasher for FastHasher {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            for &b in bytes {
+                self.add(b as u64);
+            }
+        }
+        fn write_u32(&mut self, value: u32) {
+            self.add(value as u64);
+        }
+        fn write_usize(&mut self, value: usize) {
+            self.add(value as u64);
+        }
+    }
+
+    type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
+    type FastSet<K> = HashSet<K, BuildHasherDefault<FastHasher>>;
+
     static ORIG_D3D9: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static ORIG_CREATE_DEVICE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    static ORIG_CREATE_TEXTURE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static ORIG_SET_TEXTURE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
     /// Per-texture logging is off unless `RETEX_DEBUG` is set: a log write
@@ -114,31 +168,86 @@ mod imp {
         VERBOSE.load(Ordering::Relaxed)
     }
 
-    /// Texture pointer -> `(hash, format)` when the pack replaces it, `None`
-    /// when it never will. Entries are evicted when the texture is released,
-    /// so a recycled pointer never inherits a stale hash.
-    type TextureInfo = Option<(u32, u32)>;
-    static HASH_CACHE: LazyLock<Mutex<HashMap<usize, TextureInfo>>> =
-        LazyLock::new(Default::default);
-
-    /// Texture vtable -> its original `IUnknown::Release`. Keyed by vtable
-    /// because ReShade (or a second copy of this DLL) can expose more than one
-    /// implementation, and each needs its own original to forward to.
-    static RELEASE_ORIGINALS: LazyLock<Mutex<HashMap<usize, usize>>> =
-        LazyLock::new(Default::default);
-
-    /// `(device, hash, format)` -> replacement texture, or 0 if creating it
-    /// failed (so a broken entry is not retried on every bind).
-    type ReplacementKey = (usize, u32, u32);
-    static REPLACEMENT_CACHE: LazyLock<Mutex<HashMap<ReplacementKey, usize>>> =
-        LazyLock::new(Default::default);
-    struct Packs {
-        indexes: Vec<PackageIndex>,
-        by_hash: HashMap<u32, (usize, usize)>,
+    /// What a game texture is bound as.
+    #[derive(Clone, Copy)]
+    enum Tex {
+        /// Not in any pack (or its replacement failed): bind as is.
+        Original,
+        /// In a pack; the replacement has not been created yet.
+        Replace { hash: u32, format: u32 },
+        /// Bind this replacement texture instead.
+        Ready(usize),
     }
 
-    static PACKS: Mutex<Option<Packs>> = Mutex::new(None);
+    /// Game texture pointer -> how to bind it. Entries are evicted when the
+    /// texture is released, so a recycled pointer never inherits a stale
+    /// answer, and refreshed when the game rewrites the texture.
+    static TEXTURES: LazyLock<Mutex<FastMap<usize, Tex>>> = LazyLock::new(Default::default);
+
+    /// Textures locked for writing at level 0 and not yet unlocked.
+    static WRITE_LOCKED: LazyLock<Mutex<FastSet<usize>>> = LazyLock::new(Default::default);
+
+    /// How often the game has rewritten each texture. One rewritten over and
+    /// over (a minimap, a scrolling sign) is left alone rather than re-hashed
+    /// on every update.
+    static REWRITES: LazyLock<Mutex<FastMap<usize, u32>>> = LazyLock::new(Default::default);
+    const MAX_REWRITES: u32 = 8;
+
+    /// Original texture methods, per vtable: ReShade or another wrapper can
+    /// expose more than one implementation, and each needs its own original
+    /// to forward to. `lock`/`unlock` are 0 for non-2D textures.
+    #[derive(Clone, Copy)]
+    struct VtableOriginals {
+        release: usize,
+        lock: usize,
+        unlock: usize,
+    }
+    static VTABLES: LazyLock<Mutex<FastMap<usize, VtableOriginals>>> =
+        LazyLock::new(Default::default);
+
+    /// `(hash, format)` -> replacement texture, or 0 if creating it failed (so a
+    /// broken entry is not retried on every bind). Cleared when a device is
+    /// created.
+    type ReplacementKey = (u32, u32);
+    static REPLACEMENTS: LazyLock<Mutex<FastMap<ReplacementKey, usize>>> =
+        LazyLock::new(Default::default);
+
+    /// Replacements requested while loading, created as soon as their data
+    /// has been decoded.
+    static PENDING: LazyLock<Mutex<FastSet<ReplacementKey>>> = LazyLock::new(Default::default);
+
+    struct Packs {
+        indexes: Vec<Arc<PackageIndex>>,
+        by_hash: FastMap<u32, (usize, usize)>,
+    }
+
+    /// Loaded once at startup and read-only afterwards, so lookups need no
+    /// lock.
+    static PACKS: OnceLock<Packs> = OnceLock::new();
     static INIT: Once = Once::new();
+
+    thread_local! {
+        /// Set while this hook makes its own D3D calls, so the texture hooks
+        /// forward them without treating them as the game's.
+        static BUSY: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn busy() -> bool {
+        BUSY.with(|b| b.get())
+    }
+
+    fn with_busy<T>(f: impl FnOnce() -> T) -> T {
+        let previous = BUSY.with(|b| b.replace(true));
+        let result = f();
+        BUSY.with(|b| b.set(previous));
+        result
+    }
+
+    /// Lock, ignoring poisoning: a panic elsewhere must not stop the game
+    /// from rendering.
+    fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        mutex.lock().unwrap_or_else(|error| error.into_inner())
+    }
 
     extern "system" {
         fn LoadLibraryA(name: *const u8) -> *mut c_void;
@@ -146,6 +255,8 @@ mod imp {
         fn VirtualProtect(addr: *mut c_void, size: usize, new_protect: u32, old: *mut u32) -> i32;
         fn OutputDebugStringA(text: *const u8);
         fn GetModuleFileNameW(module: *mut c_void, buffer: *mut u16, size: u32) -> u32;
+        fn CreateMutexW(attributes: *mut c_void, owner: i32, name: *const u16) -> *mut c_void;
+        fn GetLastError() -> u32;
     }
 
     pub fn log(message: &str) {
@@ -161,6 +272,10 @@ mod imp {
         if let Ok(text) = CString::new(line) {
             unsafe { OutputDebugStringA(text.as_ptr() as *const u8) };
         }
+    }
+
+    fn millis(since: Instant) -> f64 {
+        since.elapsed().as_secs_f64() * 1e3
     }
 
     unsafe fn vtable(object: *mut c_void) -> *mut *mut c_void {
@@ -225,6 +340,10 @@ mod imp {
         true
     }
 
+    // -----------------------------------------------------------------------
+    // Hashing
+    // -----------------------------------------------------------------------
+
     unsafe fn hash_level_zero(texture: *mut c_void, desc: &D3DSurfaceDesc) -> Option<u32> {
         let vt = vtable(texture);
         let lock: LockRectFn = mem::transmute(*vt.add(IDIRECT3DTEXTURE9_LOCK_RECT));
@@ -251,110 +370,437 @@ mod imp {
         ) || matches!(format, 0x3254_5844..=0x3554_5844) // DXT2..DXT5
     }
 
-    /// Hash a texture; `Some` only if the pack replaces it.
-    unsafe fn texture_info(texture: *mut c_void) -> Option<(u32, u32)> {
+    /// Hash a 2D texture's level 0; `Replace` only if a pack replaces it.
+    unsafe fn hash_texture(texture: *mut c_void) -> Tex {
         let vt = vtable(texture);
         let get_desc: GetLevelDescFn = mem::transmute(*vt.add(IDIRECT3DTEXTURE9_GET_LEVEL_DESC));
         let mut desc = D3DSurfaceDesc::default();
         if get_desc(texture, 0, &mut desc) < 0 {
-            return None;
+            return Tex::Original;
         }
 
         // Skip textures the game updates per frame (video, render targets):
         // hashing their transient contents can produce false matches.
         if desc.usage & (D3DUSAGE_DYNAMIC | D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL) != 0 {
-            return None;
+            return Tex::Original;
         }
 
-        let hash = hash_level_zero(texture, &desc)?;
+        let started = Instant::now();
+        let Some(hash) = hash_level_zero(texture, &desc) else {
+            return Tex::Original;
+        };
         if verbose() {
             log(&format!(
-                "TEXTURE {}x{} fmt=0x{:08X} pool={} hash=0x{hash:08X}",
-                desc.width, desc.height, desc.format, desc.pool
+                "TEXTURE {}x{} fmt=0x{:08X} pool={} hash=0x{hash:08X} ({:.2} ms)",
+                desc.width,
+                desc.height,
+                desc.format,
+                desc.pool,
+                millis(started)
             ));
         }
-        has_replacement(hash).then_some((hash, desc.format))
-    }
-
-    /// Start forwarding `IUnknown::Release` for this vtable so cached hashes are
-    /// dropped with the texture. Best effort, and idempotent: a vtable is
-    /// patched once even if several textures share it.
-    unsafe fn ensure_release_hook(vt: *mut *mut c_void) -> bool {
-        let key = vt as usize;
-        let Ok(mut originals) = RELEASE_ORIGINALS.lock() else {
-            return false;
-        };
-        if originals.contains_key(&key) {
-            return true;
-        }
-        let current = *vt.add(IUNKNOWN_RELEASE);
-        let hook = hook_texture_release as *const () as *mut c_void;
-        if current == hook {
-            // Already patched by this module but the entry is gone (a poisoned
-            // lock). Forwarding is impossible, but hashing stays cached.
-            return false;
-        }
-        originals.insert(key, current as usize);
-        patch_slot(vt, IUNKNOWN_RELEASE, hook);
-        log(&format!(
-            "hooked IDirect3DTexture9::Release (vtable {vt:p})"
-        ));
-        true
-    }
-
-    /// `(hash, format)` of a texture the pack replaces, hashing it only on
-    /// its first bind.
-    ///
-    /// The result is cached even when Release tracking could not be installed.
-    /// A texture that cannot be tracked at all would otherwise be re-hashed on
-    /// every single bind, which stalls the render thread (LockRect on a
-    /// D3DPOOL_DEFAULT surface, then a full-surface CRC) and, in debug builds
-    /// of this hook, wrote a log line per bind.
-    unsafe fn texture_info_cached(texture: *mut c_void) -> Option<(u32, u32)> {
-        let key = texture as usize;
-        if let Some(cached) = HASH_CACHE.lock().ok()?.get(&key) {
-            return *cached;
-        }
-
-        let vt = vtable(texture);
-        let get_type: GetTypeFn = mem::transmute(*vt.add(IDIRECT3DBASETEXTURE9_GET_TYPE));
-        let info = if get_type(texture) == D3DRTYPE_TEXTURE {
-            texture_info(texture)
-        } else {
-            // Cube/volume textures are not replaceable (the legacy hash only
-            // covers one 2D surface), but the negative answer is still worth
-            // caching.
-            None
-        };
-
-        if let Ok(mut cache) = HASH_CACHE.lock() {
-            if cache.len() < MAX_TRACKED_TEXTURES {
-                cache.insert(key, info);
+        if has_replacement(hash) {
+            Tex::Replace {
+                hash,
+                format: desc.format,
             }
+        } else {
+            Tex::Original
         }
-        ensure_release_hook(vt);
-        info
+    }
+
+    fn remember(texture: usize, state: Tex) {
+        let mut textures = lock(&TEXTURES);
+        if textures.len() < MAX_TRACKED_TEXTURES || textures.contains_key(&texture) {
+            textures.insert(texture, state);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Texture method hooks
+    // -----------------------------------------------------------------------
+
+    fn originals(texture: *mut c_void) -> Option<VtableOriginals> {
+        let key = unsafe { vtable(texture) } as usize;
+        lock(&VTABLES).get(&key).copied()
+    }
+
+    /// Hook `Release` (any texture type) and, for 2D textures,
+    /// `LockRect`/`UnlockRect`. Idempotent per vtable.
+    unsafe fn ensure_texture_hooks(vt: *mut *mut c_void, is_2d: bool) {
+        let key = vt as usize;
+        let mut vtables = lock(&VTABLES);
+        if vtables.contains_key(&key) {
+            return;
+        }
+        let release_hook = hook_texture_release as *const () as *mut c_void;
+        if *vt.add(IUNKNOWN_RELEASE) == release_hook {
+            // Patched before but the entry is gone; nothing to forward to.
+            return;
+        }
+        let mut entry = VtableOriginals {
+            release: patch_slot(vt, IUNKNOWN_RELEASE, release_hook) as usize,
+            lock: 0,
+            unlock: 0,
+        };
+        if is_2d {
+            entry.lock = patch_slot(
+                vt,
+                IDIRECT3DTEXTURE9_LOCK_RECT,
+                hook_texture_lock as *const () as *mut c_void,
+            ) as usize;
+            entry.unlock = patch_slot(
+                vt,
+                IDIRECT3DTEXTURE9_UNLOCK_RECT,
+                hook_texture_unlock as *const () as *mut c_void,
+            ) as usize;
+        }
+        vtables.insert(key, entry);
+        drop(vtables);
+        log(&format!(
+            "hooked texture methods (vtable {vt:p}, 2d={is_2d})"
+        ));
     }
 
     unsafe extern "system" fn hook_texture_release(texture: *mut c_void) -> u32 {
-        let original = RELEASE_ORIGINALS
-            .lock()
-            .ok()
-            .and_then(|originals| originals.get(&(vtable(texture) as usize)).copied());
-        let Some(original) = original else {
-            // The hook is only installed for registered vtables, so this is
-            // unreachable; leaking beats calling an unknown address.
+        let Some(original) = originals(texture) else {
+            // Only registered vtables are patched; leaking beats calling an
+            // unknown address.
             return 0;
         };
-        let original: ReleaseFn = mem::transmute(original);
-        let remaining = original(texture);
+        let release: ReleaseFn = mem::transmute(original.release);
+        let remaining = release(texture);
         if remaining == 0 {
-            if let Ok(mut cache) = HASH_CACHE.lock() {
-                cache.remove(&(texture as usize));
-            }
+            let key = texture as usize;
+            lock(&TEXTURES).remove(&key);
+            lock(&WRITE_LOCKED).remove(&key);
+            lock(&REWRITES).remove(&key);
         }
         remaining
     }
+
+    unsafe extern "system" fn hook_texture_lock(
+        texture: *mut c_void,
+        level: u32,
+        locked: *mut D3DLockedRect,
+        rect: *const c_void,
+        flags: u32,
+    ) -> i32 {
+        let Some(original) = originals(texture).filter(|o| o.lock != 0) else {
+            return D3DERR_INVALIDCALL;
+        };
+        let lock_rect: LockRectFn = mem::transmute(original.lock);
+        let hr = lock_rect(texture, level, locked, rect, flags);
+        if hr >= 0 && level == 0 && flags & D3DLOCK_READONLY == 0 && !busy() {
+            lock(&WRITE_LOCKED).insert(texture as usize);
+        }
+        hr
+    }
+
+    unsafe extern "system" fn hook_texture_unlock(texture: *mut c_void, level: u32) -> i32 {
+        let Some(original) = originals(texture).filter(|o| o.unlock != 0) else {
+            return D3DERR_INVALIDCALL;
+        };
+        let unlock_rect: UnlockRectFn = mem::transmute(original.unlock);
+        let hr = unlock_rect(texture, level);
+        if busy() {
+            return hr;
+        }
+        let written = level == 0 && lock(&WRITE_LOCKED).remove(&(texture as usize));
+        if written || READY_JOBS.load(Ordering::Acquire) > 0 {
+            with_busy(|| texture_written(texture, written));
+        }
+        hr
+    }
+
+    /// The game finished writing a texture (usually while loading): hash it
+    /// now, start decoding its replacement in the background, and create any
+    /// replacements whose data is ready.
+    unsafe fn texture_written(texture: *mut c_void, written: bool) {
+        if written && !rewritten_too_often(texture as usize) {
+            let mut state = hash_texture(texture);
+            if let Tex::Replace { hash, format } = state {
+                let existing = lock(&REPLACEMENTS).get(&(hash, format)).copied();
+                match existing {
+                    Some(0) => state = Tex::Original,
+                    Some(pointer) => state = Tex::Ready(pointer),
+                    None => {
+                        lock(&PENDING).insert((hash, format));
+                        LOADER.request(hash);
+                    }
+                }
+            }
+            remember(texture as usize, state);
+        }
+        if READY_JOBS.load(Ordering::Acquire) > 0 {
+            if let Some(device) = texture_device(texture) {
+                create_pending(device);
+                release_object(device);
+            }
+        }
+    }
+
+    /// Count a rewrite; past the limit the texture is bound as is for good.
+    fn rewritten_too_often(texture: usize) -> bool {
+        let count = {
+            let mut rewrites = lock(&REWRITES);
+            let count = rewrites.entry(texture).or_insert(0);
+            *count = count.saturating_add(1);
+            *count
+        };
+        if count > MAX_REWRITES {
+            if count == MAX_REWRITES + 1 {
+                remember(texture, Tex::Original);
+            }
+            return true;
+        }
+        false
+    }
+
+    unsafe fn texture_device(texture: *mut c_void) -> Option<*mut c_void> {
+        let get_device: GetDeviceFn =
+            mem::transmute(*vtable(texture).add(IDIRECT3DRESOURCE9_GET_DEVICE));
+        let mut device = std::ptr::null_mut();
+        (get_device(texture, &mut device) >= 0 && !device.is_null()).then_some(device)
+    }
+
+    unsafe fn release_object(object: *mut c_void) {
+        let release: ReleaseFn = mem::transmute(*vtable(object).add(IUNKNOWN_RELEASE));
+        release(object);
+    }
+
+    /// Create every pending replacement whose data is already decoded.
+    unsafe fn create_pending(device: *mut c_void) {
+        let ready: Vec<ReplacementKey> = {
+            let pending = lock(&PENDING);
+            if pending.is_empty() {
+                return;
+            }
+            pending
+                .iter()
+                .copied()
+                .filter(|&(hash, _)| LOADER.is_ready(hash))
+                .collect()
+        };
+        for (hash, format) in ready {
+            lock(&PENDING).remove(&(hash, format));
+            if let Some(job) = LOADER.try_take(hash) {
+                create_and_record(device, hash, format, job, "load");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Background decoding
+    // -----------------------------------------------------------------------
+
+    enum Job {
+        Queued,
+        Running,
+        Ready(Decoded),
+        Failed,
+    }
+
+    struct Decoded {
+        data: Vec<u8>,
+        decode_ms: f64,
+        background: bool,
+    }
+
+    struct LoaderState {
+        jobs: FastMap<u32, Job>,
+        queue: VecDeque<u32>,
+        ready_bytes: usize,
+        workers_started: bool,
+    }
+
+    /// Reads, decrypts and inflates pack entries on worker threads.
+    struct Loader {
+        state: Mutex<LoaderState>,
+        changed: Condvar,
+    }
+
+    /// Number of decoded entries waiting; lets the hot paths skip the loader
+    /// lock when there is nothing to collect.
+    static READY_JOBS: AtomicUsize = AtomicUsize::new(0);
+
+    static LOADER: LazyLock<Loader> = LazyLock::new(|| Loader {
+        state: Mutex::new(LoaderState {
+            jobs: FastMap::default(),
+            queue: VecDeque::new(),
+            ready_bytes: 0,
+            workers_started: false,
+        }),
+        changed: Condvar::new(),
+    });
+
+    impl Loader {
+        fn wait<'a>(&self, guard: MutexGuard<'a, LoaderState>) -> MutexGuard<'a, LoaderState> {
+            self.changed
+                .wait(guard)
+                .unwrap_or_else(|error| error.into_inner())
+        }
+
+        /// Queue `hash` for background decoding (no-op if already known).
+        fn request(&'static self, hash: u32) {
+            let mut state = lock(&self.state);
+            if state.jobs.contains_key(&hash) {
+                return;
+            }
+            state.jobs.insert(hash, Job::Queued);
+            state.queue.push_back(hash);
+            if !state.workers_started {
+                state.workers_started = true;
+                let count = std::thread::available_parallelism()
+                    .map_or(2, |n| n.get())
+                    .saturating_sub(1)
+                    .clamp(1, 3);
+                for n in 0..count {
+                    let _ = std::thread::Builder::new()
+                        .name(format!("retex-decode-{n}"))
+                        .spawn(move || self.work());
+                }
+                drop(state);
+                log(&format!(
+                    "decoding replacements on {count} background thread(s)"
+                ));
+            } else {
+                drop(state);
+            }
+            self.changed.notify_all();
+        }
+
+        fn work(&self) {
+            let mut state = lock(&self.state);
+            loop {
+                let next = if state.ready_bytes < MAX_READY_BYTES {
+                    state.queue.pop_front()
+                } else {
+                    None
+                };
+                let Some(hash) = next else {
+                    state = self.wait(state);
+                    continue;
+                };
+                // A job taken over by a thread that needed it immediately is
+                // no longer queued.
+                if !matches!(state.jobs.get(&hash), Some(Job::Queued)) {
+                    continue;
+                }
+                state.jobs.insert(hash, Job::Running);
+                drop(state);
+
+                let started = Instant::now();
+                let result = decode(hash);
+                let decoded = result.map(|data| Decoded {
+                    data,
+                    decode_ms: millis(started),
+                    background: true,
+                });
+
+                state = lock(&self.state);
+                match decoded {
+                    Some(decoded) => {
+                        state.ready_bytes += decoded.data.len();
+                        state.jobs.insert(hash, Job::Ready(decoded));
+                        READY_JOBS.fetch_add(1, Ordering::AcqRel);
+                    }
+                    None => {
+                        state.jobs.insert(hash, Job::Failed);
+                    }
+                }
+                self.changed.notify_all();
+            }
+        }
+
+        fn is_ready(&self, hash: u32) -> bool {
+            matches!(lock(&self.state).jobs.get(&hash), Some(Job::Ready(_)))
+        }
+
+        fn take_ready(state: &mut LoaderState, hash: u32) -> Option<Decoded> {
+            match state.jobs.remove(&hash) {
+                Some(Job::Ready(decoded)) => {
+                    state.ready_bytes -= decoded.data.len();
+                    READY_JOBS.fetch_sub(1, Ordering::AcqRel);
+                    Some(decoded)
+                }
+                Some(other) => {
+                    state.jobs.insert(hash, other);
+                    None
+                }
+                None => None,
+            }
+        }
+
+        /// Decoded data for `hash` if a worker has finished it.
+        fn try_take(&self, hash: u32) -> Option<Decoded> {
+            let decoded = Self::take_ready(&mut lock(&self.state), hash);
+            if decoded.is_some() {
+                self.changed.notify_all();
+            }
+            decoded
+        }
+
+        /// Decoded data for `hash`, now: takes it from a worker, waits for a
+        /// worker already on it, or decodes it on this thread.
+        fn take(&self, hash: u32) -> Option<Decoded> {
+            let mut state = lock(&self.state);
+            loop {
+                match state.jobs.get(&hash) {
+                    Some(Job::Ready(_)) => {
+                        let decoded = Self::take_ready(&mut state, hash);
+                        drop(state);
+                        self.changed.notify_all();
+                        return decoded;
+                    }
+                    Some(Job::Running) => state = self.wait(state),
+                    Some(Job::Failed) => return None,
+                    Some(Job::Queued) | None => {
+                        state.jobs.insert(hash, Job::Running);
+                        drop(state);
+                        let started = Instant::now();
+                        let data = decode(hash);
+                        let mut state = lock(&self.state);
+                        let result = match data {
+                            Some(data) => {
+                                state.jobs.remove(&hash);
+                                Some(Decoded {
+                                    data,
+                                    decode_ms: millis(started),
+                                    background: false,
+                                })
+                            }
+                            None => {
+                                state.jobs.insert(hash, Job::Failed);
+                                None
+                            }
+                        };
+                        drop(state);
+                        self.changed.notify_all();
+                        return result;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Read, decrypt, inflate and verify the pack entry for `hash`.
+    fn decode(hash: u32) -> Option<Vec<u8>> {
+        let packs = PACKS.get()?;
+        let &(pack_index, entry_index) = packs.by_hash.get(&hash)?;
+        let index = &packs.indexes[pack_index];
+        match index.read_entry(&index.entries[entry_index]) {
+            Ok(data) => Some(data),
+            Err(error) => {
+                log(&format!("replacement 0x{hash:08X}: {error}"));
+                None
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Replacement textures
+    // -----------------------------------------------------------------------
 
     /// Minimal 32-bit BMP decoder; returns tightly packed top-down BGRA.
     fn decode_bmp(data: &[u8]) -> Option<Replacement> {
@@ -393,6 +839,298 @@ mod imp {
             pixels,
         })
     }
+
+    /// Create a texture from BMP bytes with D3DX, like TexMod's package DLL.
+    unsafe fn d3dx_texture(device: *mut c_void, data: &[u8]) -> Option<*mut c_void> {
+        type D3dxCreateFn =
+            unsafe extern "system" fn(*mut c_void, *const c_void, u32, *mut *mut c_void) -> i32;
+
+        // Resolved once; 0 when D3DX is not installed.
+        static D3DX_CREATE: OnceLock<usize> = OnceLock::new();
+        let function = *D3DX_CREATE.get_or_init(|| {
+            let module = LoadLibraryA(b"d3dx9_43.dll\0".as_ptr());
+            if module.is_null() {
+                log("d3dx9_43.dll not available; using the built-in BMP decoder");
+                return 0;
+            }
+            GetProcAddress(module, b"D3DXCreateTextureFromFileInMemory\0".as_ptr()) as usize
+        });
+        if function == 0 {
+            return None;
+        }
+        let create: D3dxCreateFn = mem::transmute(function);
+        let mut texture: *mut c_void = std::ptr::null_mut();
+        let hr = create(
+            device,
+            data.as_ptr() as *const c_void,
+            data.len() as u32,
+            &mut texture,
+        );
+        if hr >= 0 && !texture.is_null() {
+            Some(texture)
+        } else {
+            None
+        }
+    }
+
+    unsafe fn upload_texture(
+        device: *mut c_void,
+        hash: u32,
+        replacement: &Replacement,
+    ) -> Option<*mut c_void> {
+        let device_vt = vtable(device);
+        let create: CreateTextureFn =
+            mem::transmute(*device_vt.add(IDIRECT3DDEVICE9_CREATE_TEXTURE));
+        let mut texture: *mut c_void = std::ptr::null_mut();
+        let hr = create(
+            device,
+            replacement.width,
+            replacement.height,
+            1,
+            0,
+            D3DFMT_A8R8G8B8,
+            D3DPOOL_MANAGED,
+            &mut texture,
+            std::ptr::null_mut(),
+        );
+        if hr < 0 || texture.is_null() {
+            log(&format!(
+                "replacement 0x{hash:08X}: CreateTexture failed 0x{hr:08X}"
+            ));
+            return None;
+        }
+
+        let texture_vt = vtable(texture);
+        let lock: LockRectFn = mem::transmute(*texture_vt.add(IDIRECT3DTEXTURE9_LOCK_RECT));
+        let unlock: UnlockRectFn = mem::transmute(*texture_vt.add(IDIRECT3DTEXTURE9_UNLOCK_RECT));
+        let mut locked = D3DLockedRect::default();
+        if lock(texture, 0, &mut locked, std::ptr::null(), 0) < 0 || locked.bits.is_null() {
+            log(&format!("replacement 0x{hash:08X}: LockRect failed"));
+            release_object(texture);
+            return None;
+        }
+
+        let stride = replacement.width as usize * 4;
+        for row in 0..replacement.height as usize {
+            let destination = (locked.bits as *mut u8).add(row * locked.pitch as usize);
+            let source = replacement.pixels[row * stride..].as_ptr();
+            std::ptr::copy_nonoverlapping(source, destination, stride);
+        }
+        unlock(texture, 0);
+        Some(texture)
+    }
+
+    /// Turn decoded pack data into a D3D texture: D3DX first (the same path
+    /// TexMod uses: BMP -> texture with mips), the built-in decoder as a
+    /// fallback.
+    unsafe fn create_texture(
+        device: *mut c_void,
+        hash: u32,
+        format: u32,
+        data: &[u8],
+    ) -> Option<(*mut c_void, &'static str)> {
+        if let Some(texture) = d3dx_texture(device, data) {
+            return Some((texture, "d3dx"));
+        }
+        let mut replacement = decode_bmp(data)?;
+        if !format_has_alpha(format) {
+            // The source format has no alpha; ignore whatever the BMP carries.
+            for pixel in replacement.pixels.as_chunks_mut::<4>().0 {
+                pixel[3] = 255;
+            }
+        }
+        upload_texture(device, hash, &replacement).map(|texture| (texture, "bmp"))
+    }
+
+    /// Create the replacement from decoded data and record the result.
+    unsafe fn create_and_record(
+        device: *mut c_void,
+        hash: u32,
+        format: u32,
+        decoded: Decoded,
+        context: &str,
+    ) -> Option<*mut c_void> {
+        let started = Instant::now();
+        let created = create_texture(device, hash, format, &decoded.data);
+        let create_ms = millis(started);
+        let texture = match created {
+            Some((texture, method)) => {
+                log(&format!(
+                    "REPLACE 0x{hash:08X} ({method}): decoded in {:.0} ms {}, created in {create_ms:.0} ms at {context}",
+                    decoded.decode_ms,
+                    if decoded.background { "in the background" } else { "on the game thread" },
+                ));
+                Some(texture)
+            }
+            None => {
+                log(&format!(
+                    "replacement 0x{hash:08X} unavailable; keeping the original"
+                ));
+                None
+            }
+        };
+        lock(&REPLACEMENTS).insert((hash, format), texture.map_or(0, |t| t as usize));
+        texture
+    }
+
+    /// Replacement texture for `(hash, format)`, created now if needed.
+    unsafe fn replacement(device: *mut c_void, hash: u32, format: u32) -> Option<*mut c_void> {
+        if let Some(&pointer) = lock(&REPLACEMENTS).get(&(hash, format)) {
+            return (pointer != 0).then_some(pointer as *mut c_void);
+        }
+        lock(&PENDING).remove(&(hash, format));
+        match LOADER.take(hash) {
+            Some(decoded) => create_and_record(device, hash, format, decoded, "first draw"),
+            None => {
+                lock(&REPLACEMENTS).insert((hash, format), 0);
+                None
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Device hooks
+    // -----------------------------------------------------------------------
+
+    /// What to bind for a game texture: one lookup once it is known.
+    unsafe fn bound_texture(device: *mut c_void, texture: *mut c_void) -> *mut c_void {
+        let key = texture as usize;
+        let known = lock(&TEXTURES).get(&key).copied();
+        let state = match known {
+            Some(state) => state,
+            None => with_busy(|| {
+                let vt = vtable(texture);
+                let get_type: GetTypeFn = mem::transmute(*vt.add(IDIRECT3DBASETEXTURE9_GET_TYPE));
+                let is_2d = get_type(texture) == D3DRTYPE_TEXTURE;
+                ensure_texture_hooks(vt, is_2d);
+                // Cube/volume textures are not replaceable (the legacy hash
+                // only covers one 2D surface).
+                let state = if is_2d {
+                    hash_texture(texture)
+                } else {
+                    Tex::Original
+                };
+                remember(key, state);
+                state
+            }),
+        };
+        match state {
+            Tex::Original => texture,
+            Tex::Ready(pointer) => pointer as *mut c_void,
+            Tex::Replace { hash, format } => {
+                let created = with_busy(|| replacement(device, hash, format));
+                remember(
+                    key,
+                    created.map_or(Tex::Original, |t| Tex::Ready(t as usize)),
+                );
+                created.unwrap_or(texture)
+            }
+        }
+    }
+
+    unsafe extern "system" fn hook_set_texture(
+        device: *mut c_void,
+        stage: u32,
+        texture: *mut c_void,
+    ) -> i32 {
+        let target = if texture.is_null() {
+            texture
+        } else {
+            bound_texture(device, texture)
+        };
+        let original: SetTextureFn = mem::transmute(ORIG_SET_TEXTURE.load(Ordering::Acquire));
+        original(device, stage, target)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe extern "system" fn hook_create_texture(
+        device: *mut c_void,
+        width: u32,
+        height: u32,
+        levels: u32,
+        usage: u32,
+        format: u32,
+        pool: u32,
+        out: *mut *mut c_void,
+        shared: *mut c_void,
+    ) -> i32 {
+        let original: CreateTextureFn = mem::transmute(ORIG_CREATE_TEXTURE.load(Ordering::Acquire));
+        let hr = original(
+            device, width, height, levels, usage, format, pool, out, shared,
+        );
+        // Hook the texture methods before the game fills its first texture,
+        // so it can be hashed while the game is still loading.
+        if hr >= 0 && !out.is_null() && !(*out).is_null() {
+            ensure_texture_hooks(vtable(*out), true);
+        }
+        hr
+    }
+
+    unsafe extern "system" fn hook_create_device(
+        d3d9: *mut c_void,
+        adapter: u32,
+        device_type: u32,
+        focus_window: *mut c_void,
+        behavior: u32,
+        present: *mut c_void,
+        out: *mut *mut c_void,
+    ) -> i32 {
+        let original: CreateDeviceFn = mem::transmute(ORIG_CREATE_DEVICE.load(Ordering::Acquire));
+        let hr = original(
+            d3d9,
+            adapter,
+            device_type,
+            focus_window,
+            behavior,
+            present,
+            out,
+        );
+
+        if hr >= 0 && !out.is_null() && !(*out).is_null() {
+            let device = *out;
+            // Replacements belong to the device that created them; a new
+            // device starts fresh. They are dropped, not released: their
+            // device may already be gone.
+            lock(&REPLACEMENTS).clear();
+            lock(&PENDING).clear();
+            lock(&TEXTURES).retain(|_, state| !matches!(state, Tex::Ready(_)));
+            hook_slot(
+                vtable(device),
+                IDIRECT3DDEVICE9_SET_TEXTURE,
+                hook_set_texture as *const () as *mut c_void,
+                &ORIG_SET_TEXTURE,
+                "IDirect3DDevice9::SetTexture",
+            );
+            hook_slot(
+                vtable(device),
+                IDIRECT3DDEVICE9_CREATE_TEXTURE,
+                hook_create_texture as *const () as *mut c_void,
+                &ORIG_CREATE_TEXTURE,
+                "IDirect3DDevice9::CreateTexture",
+            );
+        }
+        hr
+    }
+
+    unsafe extern "system" fn hook_direct3d_create9(sdk_version: u32) -> *mut c_void {
+        let original: Direct3DCreate9Fn = mem::transmute(ORIG_D3D9.load(Ordering::Acquire));
+        let d3d9 = original(sdk_version);
+
+        if !d3d9.is_null() {
+            hook_slot(
+                vtable(d3d9),
+                IDIRECT3D9_CREATE_DEVICE,
+                hook_create_device as *const () as *mut c_void,
+                &ORIG_CREATE_DEVICE,
+                "IDirect3D9::CreateDevice",
+            );
+        }
+        d3d9
+    }
+
+    // -----------------------------------------------------------------------
+    // Startup
+    // -----------------------------------------------------------------------
 
     /// Full path of the host executable (Unicode, any length).
     fn exe_path() -> Option<PathBuf> {
@@ -448,20 +1186,17 @@ mod imp {
     }
 
     fn load_packs() {
-        let paths = config_paths();
-        if paths.is_empty() {
-            return;
-        }
         let mut packs = Packs {
             indexes: Vec::new(),
-            by_hash: HashMap::new(),
+            by_hash: FastMap::default(),
         };
-        for path in &paths {
+        for path in &config_paths() {
             match PackageIndex::open(path) {
                 Ok(index) => {
                     let pack_index = packs.indexes.len();
                     let count = index.entries.len();
                     for (entry_index, entry) in index.entries.iter().enumerate() {
+                        // Packs apply top to bottom: the first one wins.
                         if entry.hash != 0 {
                             packs
                                 .by_hash
@@ -470,232 +1205,37 @@ mod imp {
                         }
                     }
                     log(&format!("index loaded: {count} entries from {path}"));
-                    packs.indexes.push(index);
+                    packs.indexes.push(Arc::new(index));
                 }
                 Err(error) => log(&format!("index failed ({path}): {error}")),
             }
         }
-        if let Ok(mut slot) = PACKS.lock() {
-            *slot = Some(packs);
-        }
+        let _ = PACKS.set(packs);
     }
 
     fn has_replacement(hash: u32) -> bool {
         PACKS
-            .lock()
-            .ok()
-            .and_then(|guard| Some(guard.as_ref()?.by_hash.contains_key(&hash)))
-            .unwrap_or(false)
+            .get()
+            .is_some_and(|packs| packs.by_hash.contains_key(&hash))
     }
 
-    /// Create a texture from BMP bytes with D3DX, like TexMod's package DLL.
-    unsafe fn d3dx_texture(device: *mut c_void, data: &[u8]) -> Option<*mut c_void> {
-        type D3dxCreateFn =
-            unsafe extern "system" fn(*mut c_void, *const c_void, u32, *mut *mut c_void) -> i32;
-
-        // Resolved once; 0 when D3DX is not installed.
-        static D3DX_CREATE: OnceLock<usize> = OnceLock::new();
-        let function = *D3DX_CREATE.get_or_init(|| {
-            let module = LoadLibraryA(b"d3dx9_43.dll\0".as_ptr());
-            if module.is_null() {
-                log("d3dx9_43.dll not available; using the built-in BMP decoder");
-                return 0;
-            }
-            GetProcAddress(module, b"D3DXCreateTextureFromFileInMemory\0".as_ptr()) as usize
-        });
-        if function == 0 {
-            return None;
-        }
-        let create: D3dxCreateFn = mem::transmute(function);
-        let mut texture: *mut c_void = std::ptr::null_mut();
-        let hr = create(
-            device,
-            data.as_ptr() as *const c_void,
-            data.len() as u32,
-            &mut texture,
-        );
-        if hr >= 0 && !texture.is_null() {
-            Some(texture)
-        } else {
-            None
-        }
-    }
-
-    unsafe fn create_replacement(
-        device: *mut c_void,
-        hash: u32,
-        replacement: &Replacement,
-    ) -> Option<*mut c_void> {
-        let device_vt = vtable(device);
-        let create: CreateTextureFn =
-            mem::transmute(*device_vt.add(IDIRECT3DDEVICE9_CREATE_TEXTURE));
-        let mut texture: *mut c_void = std::ptr::null_mut();
-        let hr = create(
-            device,
-            replacement.width,
-            replacement.height,
-            1,
-            0,
-            D3DFMT_A8R8G8B8,
-            D3DPOOL_MANAGED,
-            &mut texture,
-            std::ptr::null_mut(),
-        );
-        if hr < 0 || texture.is_null() {
-            log(&format!(
-                "replacement {:#010X}: CreateTexture failed 0x{hr:08X}",
-                hash
-            ));
-            return None;
-        }
-
-        let texture_vt = vtable(texture);
-        let lock: LockRectFn = mem::transmute(*texture_vt.add(IDIRECT3DTEXTURE9_LOCK_RECT));
-        let unlock: UnlockRectFn = mem::transmute(*texture_vt.add(IDIRECT3DTEXTURE9_UNLOCK_RECT));
-        let mut locked = D3DLockedRect::default();
-        if lock(texture, 0, &mut locked, std::ptr::null(), 0) < 0 || locked.bits.is_null() {
-            log(&format!("replacement {hash:#010X}: LockRect failed"));
-            return None;
-        }
-
-        let stride = replacement.width as usize * 4;
-        for row in 0..replacement.height as usize {
-            let destination = (locked.bits as *mut u8).add(row * locked.pitch as usize);
-            let source = replacement.pixels[row * stride..].as_ptr();
-            std::ptr::copy_nonoverlapping(source, destination, stride);
-        }
-        unlock(texture, 0);
-
-        log(&format!(
-            "REPLACE hash=0x{hash:08X} -> {}x{}",
-            replacement.width, replacement.height
-        ));
-        Some(texture)
-    }
-
-    /// Replacement texture for `hash` on `device`, created on first use.
-    unsafe fn replacement_for(device: *mut c_void, hash: u32, format: u32) -> Option<*mut c_void> {
-        let key = (device as usize, hash, format);
-        if let Some(&pointer) = REPLACEMENT_CACHE.lock().ok()?.get(&key) {
-            return (pointer != 0).then_some(pointer as *mut c_void);
-        }
-
-        let texture = load_replacement(device, hash, format);
-        if texture.is_none() {
-            log(&format!(
-                "replacement 0x{hash:08X} unavailable; keeping the original"
-            ));
-        }
-        if let Ok(mut cache) = REPLACEMENT_CACHE.lock() {
-            cache.insert(key, texture.map_or(0, |t| t as usize));
-        }
-        texture
-    }
-
-    unsafe fn load_replacement(device: *mut c_void, hash: u32, format: u32) -> Option<*mut c_void> {
-        let data = {
-            let guard = PACKS.lock().ok()?;
-            let packs = guard.as_ref()?;
-            let (pack_index, entry_index) = *packs.by_hash.get(&hash)?;
-            let index = &packs.indexes[pack_index];
-            match index.read_entry(&index.entries[entry_index]) {
-                Ok(data) => data,
-                Err(error) => {
-                    log(&format!("replacement 0x{hash:08X}: {error}"));
-                    return None;
-                }
-            }
-        };
-
-        // Prefer D3DX (the same path TexMod uses: BMP -> texture with mips).
-        if let Some(texture) = d3dx_texture(device, &data) {
-            log(&format!("REPLACE hash=0x{hash:08X} (d3dx)"));
-            return Some(texture);
-        }
-
-        let mut replacement = decode_bmp(&data)?;
-        if !format_has_alpha(format) {
-            // The source format has no alpha; ignore whatever the BMP carries.
-            for pixel in replacement.pixels.as_chunks_mut::<4>().0 {
-                pixel[3] = 255;
-            }
-        }
-        create_replacement(device, hash, &replacement)
-    }
-
-    unsafe extern "system" fn hook_set_texture(
-        device: *mut c_void,
-        stage: u32,
-        texture: *mut c_void,
-    ) -> i32 {
-        let mut target = texture;
-        if !texture.is_null() {
-            if let Some((hash, format)) = texture_info_cached(texture) {
-                if let Some(replacement) = replacement_for(device, hash, format) {
-                    target = replacement;
-                }
-            }
-        }
-        let original: SetTextureFn = mem::transmute(ORIG_SET_TEXTURE.load(Ordering::Acquire));
-        original(device, stage, target)
-    }
-
-    unsafe extern "system" fn hook_create_device(
-        d3d9: *mut c_void,
-        adapter: u32,
-        device_type: u32,
-        focus_window: *mut c_void,
-        behavior: u32,
-        present: *mut c_void,
-        out: *mut *mut c_void,
-    ) -> i32 {
-        let original: CreateDeviceFn = mem::transmute(ORIG_CREATE_DEVICE.load(Ordering::Acquire));
-        let hr = original(
-            d3d9,
-            adapter,
-            device_type,
-            focus_window,
-            behavior,
-            present,
-            out,
-        );
-
-        if hr >= 0 && !out.is_null() && !(*out).is_null() {
-            let device = *out;
-            // A new device may reuse a destroyed one's address; its cached
-            // replacements belonged to the old device. They are dropped, not
-            // released: their device is gone.
-            if let Ok(mut cache) = REPLACEMENT_CACHE.lock() {
-                cache.retain(|&(owner, _, _), _| owner != device as usize);
-            }
-            hook_slot(
-                vtable(device),
-                IDIRECT3DDEVICE9_SET_TEXTURE,
-                hook_set_texture as *const () as *mut c_void,
-                &ORIG_SET_TEXTURE,
-                "IDirect3DDevice9::SetTexture",
-            );
-        }
-        hr
-    }
-
-    unsafe extern "system" fn hook_direct3d_create9(sdk_version: u32) -> *mut c_void {
-        let original: Direct3DCreate9Fn = mem::transmute(ORIG_D3D9.load(Ordering::Acquire));
-        let d3d9 = original(sdk_version);
-
-        if !d3d9.is_null() {
-            hook_slot(
-                vtable(d3d9),
-                IDIRECT3D9_CREATE_DEVICE,
-                hook_create_device as *const () as *mut c_void,
-                &ORIG_CREATE_DEVICE,
-                "IDirect3D9::CreateDevice",
-            );
-        }
-        d3d9
+    /// True if another copy of this hook (an ASI plugin plus an injected
+    /// DLL, say) is already active in this process.
+    unsafe fn another_copy_active() -> bool {
+        let name: Vec<u16> = format!("Local\\retex-hook-{}", std::process::id())
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // Deliberately never closed: it marks the process for its lifetime.
+        let handle = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
+        !handle.is_null() && GetLastError() == ERROR_ALREADY_EXISTS
     }
 
     unsafe fn install() {
+        if another_copy_active() {
+            log("another Retex hook is already active in this process; this copy stays idle");
+            return;
+        }
         let debug =
             std::env::var_os("RETEX_DEBUG").is_some_and(|value| !value.is_empty() && value != "0");
         VERBOSE.store(debug, Ordering::Relaxed);

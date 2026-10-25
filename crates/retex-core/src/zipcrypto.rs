@@ -75,24 +75,43 @@ pub fn encrypt(data: &[u8], password: &[u8], check_byte: u8) -> Vec<u8> {
 /// The check byte is the high byte of the entry CRC (from the central
 /// directory, so it also works for entries with a data descriptor).
 pub fn decrypt(encrypted: &[u8], password: &[u8], expected_check: u8) -> Option<Vec<u8>> {
-    if encrypted.len() < 12 {
+    let mut data = encrypted.to_vec();
+    let body = decrypt_in_place(&mut data, password, expected_check)?;
+    data.drain(..body);
+    Some(data)
+}
+
+/// Decrypt in place; returns the offset of the plaintext (after the 12-byte
+/// header), or `None` if the check byte does not match.
+///
+/// Avoids a second buffer: entries are decrypted on the game's thread, and
+/// the cipher is byte-serial, so the loop itself is the cost.
+pub fn decrypt_in_place(data: &mut [u8], password: &[u8], expected_check: u8) -> Option<usize> {
+    if data.len() < 12 {
         return None;
     }
     let mut keys = Keys::new(password);
-    let mut last = 0u8;
-    for &b in &encrypted[..12] {
-        let p = b ^ keys.stream_byte();
-        keys.update(p);
-        last = p;
+    for b in &mut data[..12] {
+        *b ^= keys.stream_byte();
+        keys.update(*b);
     }
-    if last != expected_check {
+    if data[11] != expected_check {
         return None;
     }
-    let mut out = Vec::with_capacity(encrypted.len() - 12);
-    for &b in &encrypted[12..] {
-        let p = b ^ keys.stream_byte();
-        keys.update(p);
-        out.push(p);
+    let Keys {
+        mut k0,
+        mut k1,
+        mut k2,
+    } = keys;
+    for b in &mut data[12..] {
+        let t = (k2 | 2) & 0xFFFF;
+        let plain = *b ^ ((t.wrapping_mul(t ^ 1)) >> 8) as u8;
+        *b = plain;
+        k0 = (k0 >> 8) ^ TABLE[((k0 ^ plain as u32) & 0xFF) as usize];
+        k1 = (k1.wrapping_add(k0 & 0xFF))
+            .wrapping_mul(134_775_813)
+            .wrapping_add(1);
+        k2 = (k2 >> 8) ^ TABLE[((k2 ^ (k1 >> 24)) & 0xFF) as usize];
     }
-    Some(out)
+    Some(12)
 }
