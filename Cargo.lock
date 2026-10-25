@@ -2638,7 +2638,7 @@ dependencies = [
 
 [[package]]
 name = "retex-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "eframe",
  "egui_extras",
@@ -2652,7 +2652,7 @@ dependencies = [
 
 [[package]]
 name = "retex-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2663,7 +2663,7 @@ dependencies = [
 
 [[package]]
 name = "retex-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "flate2",
  "rand",
@@ -2672,7 +2672,7 @@ dependencies = [
 
 [[package]]
 name = "retex-hook"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "minhook",
  "retex-core",
@@ -2680,7 +2680,7 @@ dependencies = [
 
 [[package]]
 name = "retex-inject"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rfd"
