@@ -1,7 +1,3 @@
-<img src="assets/icon-128.png" width="64" height="64" alt="">
-
-# Retex
-
 A modern, open-source replacement for **TexMod**, the 2006 Direct3D 9
 texture-replacement tool. Retex loads existing `.tpf` texture packs into D3D9
 games: same packs, same texture hashes, no 2006-era packer or antivirus
